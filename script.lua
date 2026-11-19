@@ -1890,6 +1890,7 @@ else
         local function hideInstance(d)
             pcall(function()
                 if d:IsA("BasePart") then
+                    d.Anchored = false
                     d.Transparency = 1
                     d.CastShadow = false
                     d.CanCollide = false
@@ -1923,6 +1924,58 @@ else
             table.clear(cloned)
         end
 
+        -- true: scale the aura so it is exactly as tall as your character
+        -- (feet to head). false: keep the aura at its authored size.
+        local MATCH_HEIGHT = true
+
+        local BODY_PART_NAMES = {
+            Head = true, Torso = true, UpperTorso = true, LowerTorso = true,
+            ["Left Arm"] = true, ["Right Arm"] = true,
+            ["Left Leg"] = true, ["Right Leg"] = true,
+            LeftUpperArm = true, LeftLowerArm = true, LeftHand = true,
+            RightUpperArm = true, RightLowerArm = true, RightHand = true,
+            LeftUpperLeg = true, LeftLowerLeg = true, LeftFoot = true,
+            RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
+        }
+
+        -- Anything in an aura asset that can push, hold or re-rig your character.
+        -- These are what froze you with Iceman, so they never get copied over.
+        local PHYSICS_CLASSES = {
+            "Humanoid", "Animator", "AnimationController", "ForceField",
+            "BodyMover", "Constraint", "JointInstance", "WeldConstraint",
+        }
+
+        local function sanitize(root)
+            local doomed = {}
+            for _, d in root:GetDescendants() do
+                for _, cls in PHYSICS_CLASSES do
+                    if d:IsA(cls) then
+                        table.insert(doomed, d)
+                        break
+                    end
+                end
+            end
+            for _, d in doomed do pcall(function() d:Destroy() end) end
+        end
+
+        -- World-space bounding box of a list of parts (respects rotation).
+        local function worldBounds(parts)
+            local lo = Vector3.new(math.huge, math.huge, math.huge)
+            local hi = Vector3.new(-math.huge, -math.huge, -math.huge)
+            for _, p in parts do
+                local cf, sz = p.CFrame, p.Size
+                local r, u, l = cf.RightVector, cf.UpVector, cf.LookVector
+                local half = Vector3.new(
+                    (math.abs(r.X) * sz.X + math.abs(u.X) * sz.Y + math.abs(l.X) * sz.Z) / 2,
+                    (math.abs(r.Y) * sz.X + math.abs(u.Y) * sz.Y + math.abs(l.Y) * sz.Z) / 2,
+                    (math.abs(r.Z) * sz.X + math.abs(u.Z) * sz.Y + math.abs(l.Z) * sz.Z) / 2
+                )
+                lo = lo:Min(cf.Position - half)
+                hi = hi:Max(cf.Position + half)
+            end
+            return lo, hi
+        end
+
         local function cloneOntoBody()
             local character = LocalPlayer.Character
             local hrp = character and character:FindFirstChild("HumanoidRootPart")
@@ -1935,71 +1988,106 @@ else
             clearCloned()
 
             local weldCount = 0
-            local function track(inst)
-                table.insert(cloned, inst)
-                -- Anything the clone spawns later gets hidden too.
-                table.insert(hideConns, inst.DescendantAdded:Connect(hideInstance))
-            end
-
-            local function mount(inst)
-                -- Hide before it ever touches the workspace so it never flashes.
-                hideTree(inst)
-
-                if inst:IsA("BasePart") or inst:IsA("Model") then
-                    local parts = {}
-                    if inst:IsA("BasePart") then
-                        parts[1] = inst
-                    else
-                        for _, d in inst:GetDescendants() do
-                            if d:IsA("BasePart") then
-                                parts[#parts + 1] = d
-                            end
-                        end
-                    end
-
-                    -- Put the clone exactly on the root (inside the body) before welding.
-                    if inst:IsA("Model") then
-                        inst:PivotTo(hrp.CFrame)
-                    else
-                        inst.CFrame = hrp.CFrame
-                    end
-
-                    for _, part in parts do
-                        part.Anchored = false
-                    end
-
-                    -- Into the character first, then weld every part to the root
-                    -- so the whole clone follows every movement. Parts are already
-                    -- invisible, non-colliding, untouchable and massless.
-                    inst.Parent = character
-                    for _, part in parts do
-                        local w = Instance.new("WeldConstraint")
-                        w.Name = "BodyAuraFollowWeld"
-                        w.Part0 = hrp
-                        w.Part1 = part
-                        w.Parent = part
-                        weldCount += 1
-                    end
-                    track(inst)
-                elseif inst:IsA("Folder") or inst:IsA("Configuration") then
-                    for _, c in inst:GetChildren() do
-                        mount(c)
-                    end
-                    inst:Destroy()
-                else
-                    -- Keep non-part effects attached to the moving root.
-                    inst.Parent = hrp
-                    track(inst)
-                end
-            end
-
             local ok, err = pcall(function()
                 local copy = item:Clone()
                 -- Never run scripts copied out of the shop asset.
                 for _, d in copy:GetDescendants() do
                     if d:IsA("LuaSourceContainer") then d:Destroy() end
                 end
-                mount(copy)
+                -- No humanoids, body movers, constraints or joints from the asset.
+                sanitize(copy)
+
+                -- Put everything in one holder so it moves/scales as one piece.
+                local holder = Instance.new("Model")
+                holder.Name = "BodyAuraHolder"
+                if copy:IsA("Folder") or copy:IsA("Configuration") then
+                    for _, c in copy:GetChildren() do c.Parent = holder end
+                    copy:Destroy()
+                else
+                    copy.Parent = holder
+                end
+
+                -- Invisible, no collision, no touch, unanchored, massless.
+                hideTree(holder)
+
+                local cloneParts = {}
+                for _, d in holder:GetDescendants() do
+                    if d:IsA("BasePart") then cloneParts[#cloneParts + 1] = d end
+                end
+
+                if #cloneParts > 0 then
+                    -- Start on the character, facing the same way, standing upright.
+                    local look = hrp.CFrame.LookVector
+                    local flat = Vector3.new(look.X, 0, look.Z)
+                    if flat.Magnitude < 1e-3 then flat = Vector3.new(0, 0, -1) end
+                    holder:PivotTo(CFrame.lookAt(hrp.Position, hrp.Position + flat))
+
+                    -- Your character's feet and height, from the body parts only.
+                    local charParts = {}
+                    for _, d in character:GetChildren() do
+                        if d:IsA("BasePart") and BODY_PART_NAMES[d.Name] then
+                            charParts[#charParts + 1] = d
+                        end
+                    end
+                    local feetY, charH
+                    if #charParts > 0 then
+                        local clo, chi = worldBounds(charParts)
+                        feetY, charH = clo.Y, chi.Y - clo.Y
+                    else
+                        feetY, charH = hrp.Position.Y - 3, 5
+                    end
+
+                    -- Same height as your character.
+                    local lo, hi = worldBounds(cloneParts)
+                    local cloneH = hi.Y - lo.Y
+                    if MATCH_HEIGHT and cloneH > 0.05 and charH > 0.05 then
+                        pcall(function()
+                            holder:ScaleTo(math.clamp(charH / cloneH, 0.05, 20))
+                        end)
+                        lo, hi = worldBounds(cloneParts)
+                    end
+
+                    -- Feet to feet, centered on your body.
+                    holder:PivotTo(holder:GetPivot() + Vector3.new(
+                        hrp.Position.X - (lo.X + hi.X) / 2,
+                        feetY - lo.Y,
+                        hrp.Position.Z - (lo.Z + hi.Z) / 2
+                    ))
+                end
+
+                -- Everything with geometry goes into one folder on your character;
+                -- loose effects (attachments, emitters) go on the root.
+                local clones = Instance.new("Folder")
+                clones.Name = "BodyAuraClones"
+                clones.Parent = character
+                table.insert(cloned, clones)
+                -- Anything the clone spawns later gets hidden too.
+                table.insert(hideConns, clones.DescendantAdded:Connect(hideInstance))
+
+                for _, piece in holder:GetChildren() do
+                    local hasPart = piece:IsA("BasePart") or piece:FindFirstChildWhichIsA("BasePart", true)
+                    if hasPart then
+                        piece.Parent = clones
+                    else
+                        piece.Parent = hrp
+                        table.insert(cloned, piece)
+                    end
+                end
+
+                -- Weld every part to the root so the whole clone follows every move.
+                for _, d in clones:GetDescendants() do
+                    if d:IsA("BasePart") then
+                        d.Anchored = false
+                        local w = Instance.new("WeldConstraint")
+                        w.Name = "BodyAuraFollowWeld"
+                        w.Part0 = hrp
+                        w.Part1 = d
+                        w.Parent = d
+                        weldCount += 1
+                    end
+                end
+
+                holder:Destroy()
             end)
             if not ok then warn("[BodyAura] clone failed: " .. tostring(err)) end
             return ok, err, weldCount
@@ -2076,7 +2164,7 @@ else
             watchRespawn(false)
             local msg
             if ok then
-                msg = "On your body: " .. s.BodyAura.Selected .. " (" .. tostring(welded) .. " parts welded, invisible)"
+                msg = "On your body: " .. s.BodyAura.Selected .. " (" .. tostring(welded) .. " parts, feet aligned, invisible)"
             else
                 msg = "Failed: " .. tostring(err)
             end
