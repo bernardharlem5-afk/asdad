@@ -83,9 +83,49 @@ local function getChar()
         char:FindFirstChild("HumanoidRootPart")
 end
 
+-- One extra jump while airborne. Sets a fixed upward speed (a normal jump times the
+-- Infinite Jump power) once, with a cooldown, so it can never build up or run away.
+local function infJumpTry(hum, hrp, onlyWhenFalling)
+    local cfg = HVH.cfg
+    if not cfg or not cfg.InfiniteJump.Enabled then return end
+    local now = os.clock()
+    if now - (HVH.lastInfJump or 0) < 0.25 then return end
+    -- Only a limited number of air jumps; landing resets the count.
+    if (HVH.airJumps or 0) >= (cfg.InfiniteJump.Count or 2) then return end
+    local st = hum:GetState()
+    if st ~= Enum.HumanoidStateType.Freefall and st ~= Enum.HumanoidStateType.Jumping then
+        return
+    end
+    local v = hrp.AssemblyLinearVelocity
+    if onlyWhenFalling and v.Y > 0 then return end
+    HVH.lastInfJump = now
+    HVH.airJumps = (HVH.airJumps or 0) + 1
+    local base = hum.UseJumpPower and hum.JumpPower
+        or math.sqrt(2 * workspace.Gravity * hum.JumpHeight)
+    local jumpSpeed = math.clamp(base * (cfg.InfiniteJump.Power or 1), 10, 120)
+    hrp.AssemblyLinearVelocity = Vector3.new(v.X, jumpSpeed, v.Z)
+end
+
 local function hvhStart()
     if HVH.conn then HVH.conn:Disconnect(); HVH.conn = nil end
+    if HVH.infJumpState.conn then HVH.infJumpState.conn:Disconnect(); HVH.infJumpState.conn = nil end
     if not HVH.cfg then return end
+
+    -- Every jump press (space or the mobile jump button). On the ground this just
+    -- starts the cooldown so the normal jump never double-fires; in the air it gives
+    -- one extra jump per press.
+    HVH.infJumpState.conn = UserInputService.JumpRequest:Connect(function()
+        local cfg = HVH.cfg
+        if not cfg or not cfg.InfiniteJump.Enabled then return end
+        local _, hum, hrp = getChar()
+        if not hum or not hrp then return end
+        if hum.FloorMaterial ~= Enum.Material.Air then
+            HVH.lastInfJump = os.clock()
+            HVH.airJumps = 0
+            return
+        end
+        infJumpTry(hum, hrp, false)
+    end)
 
     HVH.active = true
     HVH.swimEngaged = false
@@ -129,24 +169,15 @@ local function hvhStart()
             HVH.swimEngaged = false
         end
 
-        if cfg.InfiniteJump.Enabled and hrp then
-            local held = UserInputService:IsKeyDown(Enum.KeyCode.Space)
-                or (isMobile and hum.Jump)
-            if held then
-                local st = hum:GetState()
-                if st == Enum.HumanoidStateType.Freefall
-                    or st == Enum.HumanoidStateType.Jumping then
-                    hum.Jump = false
-                    task.wait()
-                    hum.Jump = true
-                    hum:ChangeState(Enum.HumanoidStateType.Jumping)
-                    local v = hrp.AssemblyLinearVelocity
-                    local cap = 50 * (cfg.InfiniteJump.Power or 1)
-                    if v.Y > cap then
-                        hrp.AssemblyLinearVelocity = Vector3.new(v.X, cap, v.Z)
-                    end
-                end
-            end
+        -- Landing gives the air jumps back.
+        if hum.FloorMaterial ~= Enum.Material.Air then HVH.airJumps = 0 end
+
+        -- Double jump, hold-to-repeat (keyboard). Re-jumps only once you are
+        -- already falling, and only up to the air jump limit.
+        -- Taps (keyboard or mobile button) are handled by the JumpRequest hook above.
+        if cfg.InfiniteJump.Enabled and hrp and not isMobile
+            and UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+            infJumpTry(hum, hrp, true)
         end
 
         if cfg.Speed.Enabled and hrp and hum.MoveDirection.Magnitude > 0.05 then
@@ -161,6 +192,7 @@ end
 local function hvhStop()
     HVH.active = false
     if HVH.conn then HVH.conn:Disconnect(); HVH.conn = nil end
+    if HVH.infJumpState.conn then HVH.infJumpState.conn:Disconnect(); HVH.infJumpState.conn = nil end
     HVH.swimEngaged = false
 end
 
@@ -238,17 +270,24 @@ local function buildHVHTab(tab, cfg)
         Callback = function(v) cfg.Speed.Multiplier = v end,
     })
 
-    tab:CreateSection("Infinite Jump")
+    tab:CreateSection("Double Jump")
     tab:CreateToggle({
-        Name = "Infinite Jump",
-        Desc = "Hold space to keep jumping (yields jump cooldown).",
+        Name = "Double jump",
+        Desc = "Jump again in mid-air, up to the air jump limit. Landing resets it.",
         Flag = "hvh_infjump",
         CurrentValue = cfg.InfiniteJump.Enabled,
         Callback = function(v) cfg.InfiniteJump.Enabled = v end,
     })
     tab:CreateSlider({
-        Name = "Infinite Jump power",
-        Desc = "Caps upward velocity after re-jumping.",
+        Name = "Air jumps",
+        Desc = "How many extra jumps you get in the air before it stops (1 = classic double jump).",
+        Range = { 1, 5 }, Increment = 1,
+        CurrentValue = cfg.InfiniteJump.Count, Flag = "hvh_infjump_count",
+        Callback = function(v) cfg.InfiniteJump.Count = v end,
+    })
+    tab:CreateSlider({
+        Name = "Double jump strength",
+        Desc = "Strength of each extra jump (1 = a normal jump).",
         Range = { 0.1, 5 }, Increment = 0.1,
         CurrentValue = cfg.InfiniteJump.Power, Flag = "hvh_infjump_power",
         Callback = function(v) cfg.InfiniteJump.Power = v end,
@@ -269,7 +308,7 @@ if isArcade then
             HipHeight = { Enabled = false, Value = 0, Default = 0 },
             Swim = { Enabled = false, Power = 1 },
             Speed = { Enabled = false, Mult = 1.35, Keybind = Enum.KeyCode.RightShift },
-            InfiniteJump = { Enabled = false, Power = 1 },
+            InfiniteJump = { Enabled = false, Power = 1, Count = 2 },
         },
         AntiContest = {
             Enabled = false,
@@ -417,7 +456,7 @@ if isArcade then
 
     local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "swords" })
     local BallTab = Window:CreateTab({ Name = "Ball", Icon = "circle" })
-    local HVHTab = Window:CreateTab({ Name = "HVH", Icon = "activity" })
+    local HVHTab = Window:CreateTab({ Name = "Movement", Icon = "activity" })
 
     CombatTab:CreateSection("Auto Green")
     CombatTab:CreateToggle({
@@ -655,7 +694,7 @@ elseif isBL then
             HipHeight = { Enabled = false, Value = 0, Default = 0 },
             Swim = { Enabled = false, Power = 1 },
             Speed = { Enabled = false, Mult = 1.35, Keybind = Enum.KeyCode.RightShift },
-            InfiniteJump = { Enabled = false, Power = 1 },
+            InfiniteJump = { Enabled = false, Power = 1, Count = 2 },
         },
         Mag = {
             Enabled = false,
@@ -768,7 +807,7 @@ elseif isBL then
 
     local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "swords" })
     local BallTab = Window:CreateTab({ Name = "Ball", Icon = "circle" })
-    local HVHTab = Window:CreateTab({ Name = "HVH", Icon = "activity" })
+    local HVHTab = Window:CreateTab({ Name = "Movement", Icon = "activity" })
 
     CombatTab:CreateSection("Auto Green")
     CombatTab:CreateToggle({
@@ -1028,7 +1067,7 @@ else
             HipHeight = { Enabled = false, Value = 0, Default = 0 },
             Swim = { Enabled = false, Power = 1 },
             Speed = { Enabled = false, Mult = 1.35, Keybind = Enum.KeyCode.RightShift },
-            InfiniteJump = { Enabled = false, Power = 1 },
+            InfiniteJump = { Enabled = false, Power = 1, Count = 2 },
         },
         Misc = { AntiModerator = false, DeviceSpoofer = false, Device = "PC", MobilePanel = true },
         Visuals = {
@@ -2882,10 +2921,9 @@ end)
 
     local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "swords" })
     local BallTab = Window:CreateTab({ Name = "Ball", Icon = "circle" })
-    local HVHTab = Window:CreateTab({ Name = "HVH", Icon = "activity" })
-    local VisualsTab = Window:CreateTab({ Name = "Visuals", Icon = "eye" })
-    local PrivacyTab = Window:CreateTab({ Name = "Privacy", Icon = "user" })
-    local UtilityTab = Window:CreateTab({ Name = "Utility", Icon = "list" })
+    local MoveTab = Window:CreateTab({ Name = "Movement", Icon = "activity" })
+    local CosmeticsTab = Window:CreateTab({ Name = "Cosmetics", Icon = "eye" })
+    local SafetyTab = Window:CreateTab({ Name = "Safety", Icon = "user" })
 
     CombatTab:CreateSection("Silent Aim")
     CombatTab:CreateToggle({
@@ -2944,6 +2982,7 @@ end)
         CurrentValue = s.Shooting.MissChance, Flag = "fatal_miss",
         Callback = function(v) s.Shooting.MissChance = v end,
     })
+
     CombatTab:CreateSection("Auto Guard")
     CombatTab:CreateToggle({
         Name = "Auto guard", Flag = "fatal_guard", CurrentValue = s.Defending.AutoGuard,
@@ -2975,6 +3014,19 @@ end)
         Name = "Prediction strength", Range = { 0.1, 1 }, Increment = 0.05,
         CurrentValue = s.Defending.GuardPrediction, Flag = "fatal_guard_pred",
         Callback = function(v) s.Defending.GuardPrediction = v end,
+    })
+
+    CombatTab:CreateSection("Aimbot Range Indicator")
+    CombatTab:CreateToggle({
+        Name = "Aimbot range indicator", Flag = "fatal_ind",
+        CurrentValue = s.Visuals.ShotIndicator,
+        Callback = setShotIndicator,
+    })
+    CombatTab:CreateDropdown({
+        Name = "Indicator color",
+        Options = { "Blue", "Purple", "Green", "Red", "Yellow" },
+        CurrentValue = s.Visuals.IndicatorColor, Flag = "fatal_ind_col",
+        Callback = function(v) s.Visuals.IndicatorColor = v; applyIndicatorColor() end,
     })
 
     BallTab:CreateSection("Ball Magnet")
@@ -3065,151 +3117,52 @@ end)
         end,
     })
 
-    BallTab:CreateSection("TPWalk")
-    BallTab:CreateToggle({
+    buildHVHTab(MoveTab, s.HVH)
+
+    MoveTab:CreateSection("TPWalk")
+    MoveTab:CreateToggle({
         Name = "tpwalk",
         Desc = "Teleport-walk; nudges your root part each frame for a smooth glide.",
         Flag = "fatal_tpwalk", CurrentValue = s.TPWalk.Enabled,
         Callback = function(v) setTPWalk(v) end,
     })
-    BallTab:CreateKeybind({
+    MoveTab:CreateKeybind({
         Name = "tpwalk keybind", Flag = "fatal_tpwalk_key",
         CurrentValue = s.TPWalk.Keybind,
         Callback = function(key)
             if typeof(key) == "EnumItem" then s.TPWalk.Keybind = key end
         end,
     })
-    BallTab:CreateSlider({
+    MoveTab:CreateSlider({
         Name = "tpwalk speed", Desc = "Step distance per frame (0.001 – 0.06).",
         Range = { 0.001, 0.06 }, Increment = 0.001,
         CurrentValue = s.TPWalk.Speed, Flag = "fatal_tpwalk_speed",
         Callback = function(v) s.TPWalk.Speed = v end,
     })
 
-    buildHVHTab(HVHTab, s.HVH)
-
-    VisualsTab:CreateSection("Aimbot Range Indicator")
-    VisualsTab:CreateToggle({
-        Name = "Aimbot range indicator", Flag = "fatal_ind",
-        CurrentValue = s.Visuals.ShotIndicator,
-        Callback = setShotIndicator,
-    })
-    VisualsTab:CreateDropdown({
-        Name = "Indicator color",
-        Options = { "Blue", "Purple", "Green", "Red", "Yellow" },
-        CurrentValue = s.Visuals.IndicatorColor, Flag = "fatal_ind_col",
-        Callback = function(v) s.Visuals.IndicatorColor = v; applyIndicatorColor() end,
-    })
-
-    VisualsTab:CreateSection("Goal Effect")
-    local function getEffectNames()
-        local names = {}
-        for k in pairs(Effects) do table.insert(names, k) end
-        table.sort(names)
-        return names
-    end
-    VisualsTab:CreateDropdown({
-        Name = "Select effect", Options = getEffectNames(),
-        CurrentValue = s.Goal.SelectedEffect, Flag = "fatal_goal_sel",
+    CosmeticsTab:CreateSection("Body Aura Changer")
+    CosmeticsTab:CreateDropdown({
+        Name = "Select body aura", Options = BodyAura.Names,
+        CurrentValue = s.BodyAura.Selected, Flag = "fatal_bodyaura_sel",
         Callback = function(v)
-            s.Goal.SelectedEffect = v
-            s.Goal.CurrentEffect = v
-            if s.Goal.Enabled then pcall(applyGoalEffect) end
+            s.BodyAura.Selected = v
+            if s.BodyAura.Enabled then pcall(BodyAura.apply) end
         end,
     })
-    VisualsTab:CreateToggle({
-        Name = "Enable goal effect changer", Flag = "fatal_goal",
-        CurrentValue = s.Goal.Enabled,
+    CosmeticsTab:CreateToggle({
+        Name = "Enable body aura changer", Flag = "fatal_bodyaura",
+        CurrentValue = s.BodyAura.Enabled,
         Callback = function(v)
-            s.Goal.Enabled = v
-            if v then pcall(applyGoalEffect) else pcall(resetGoalEffect) end
+            if v then pcall(BodyAura.apply) else pcall(BodyAura.reset) end
         end,
     })
-    VisualsTab:CreateButton({
-        Name = "Reset goal effect",
-        Callback = function()
-            s.Goal.Enabled = false
-            s.Goal.SelectedEffect = "LightRay"
-            s.Goal.CurrentEffect = "LightRay"
-            pcall(resetGoalEffect)
-        end,
+    CosmeticsTab:CreateButton({
+        Name = "Force aura onto body (clone)",
+        Callback = function() pcall(BodyAura.force) end,
     })
 
-    VisualsTab:CreateSection("Court Spoofer")
-    VisualsTab:CreateDropdown({
-        Name = "Select court", Options = #CourtNames > 0 and CourtNames or { "None" },
-        CurrentValue = s.CourtSpoofer.SelectedCourt, Flag = "fatal_court_sel",
-        Callback = function(v)
-            s.CourtSpoofer.SelectedCourt = v
-            s.CourtSpoofer.CurrentCourt = v
-            if s.CourtSpoofer.Enabled then pcall(applyCourtSpoofer) end
-        end,
-    })
-    VisualsTab:CreateToggle({
-        Name = "Enable court spoofer", Flag = "fatal_court",
-        CurrentValue = s.CourtSpoofer.Enabled,
-        Callback = function(v)
-            s.CourtSpoofer.Enabled = v
-            if v then pcall(applyCourtSpoofer) else pcall(resetCourtSpoofer) end
-        end,
-    })
-    VisualsTab:CreateButton({
-        Name = "Reset court",
-        Callback = function()
-            s.CourtSpoofer.Enabled = false
-            s.CourtSpoofer.SelectedCourt = "None"
-            s.CourtSpoofer.CurrentCourt = "None"
-            pcall(resetCourtSpoofer)
-        end,
-    })
-
-    VisualsTab:CreateSection("Nameplate & Title")
-    VisualsTab:CreateToggle({
-        Name = "Hide my nameplate & tags", Flag = "fatal_np_hide",
-        CurrentValue = s.Visuals.HideOwnNameplate,
-        Callback = function(v) s.Visuals.HideOwnNameplate = v; applyOwnNameplate() end,
-    })
-    VisualsTab:CreateInput({
-        Name = "Custom username", Placeholder = "e.g. Nova",
-        CurrentValue = s.Visuals.CustomNameText, Flag = "fatal_np_name",
-        Callback = function(text)
-            s.Visuals.CustomNameText = text
-            s.Visuals.CustomName = (text ~= "")
-            applyOwnNameplate()
-        end,
-    })
-    VisualsTab:CreateInput({
-        Name = "Custom record", Placeholder = "e.g. 99-0",
-        CurrentValue = s.Visuals.CustomRecordText, Flag = "Calm_np_rec",
-        Callback = function(text)
-            s.Visuals.CustomRecordText = text
-            s.Visuals.CustomRecord = (text ~= "")
-            applyOwnNameplate()
-        end,
-    })
-    VisualsTab:CreateInput({
-        Name = "Custom title", Placeholder = "e.g. Nova Elite",
-        CurrentValue = s.Visuals.CustomTitleText, Flag = "fatal_np_title",
-        Callback = function(text)
-            s.Visuals.CustomTitleText = text
-            s.Visuals.CustomTitle = (text ~= "")
-            applyOwnNameplate()
-        end,
-    })
-
-    PrivacyTab:CreateSection("Device Spoofer")
-    PrivacyTab:CreateToggle({
-        Name = "Device spoofer", Flag = "fatal_dev", CurrentValue = s.Misc.DeviceSpoofer,
-        Callback = function(v) s.Misc.DeviceSpoofer = v; SpoofDevice() end,
-    })
-    PrivacyTab:CreateDropdown({
-        Name = "Device", Options = { "PC", "Mobile", "Gamepad" },
-        CurrentValue = s.Misc.Device, Flag = "fatal_dev_sel",
-        Callback = function(v) s.Misc.Device = v; SpoofDevice() end,
-    })
-
-    PrivacyTab:CreateSection("Ball Changer")
-    PrivacyTab:CreateDropdown({
+    CosmeticsTab:CreateSection("Ball Changer")
+    CosmeticsTab:CreateDropdown({
         Name = "Select ball", Options = #BallNames > 0 and BallNames or { "None" },
         CurrentValue = s.BallChanger.SelectedBall, Flag = "fatal_ball_sel",
         Callback = function(v)
@@ -3218,7 +3171,7 @@ end)
             if s.BallChanger.Enabled then pcall(applyBallChanger) end
         end,
     })
-    PrivacyTab:CreateToggle({
+    CosmeticsTab:CreateToggle({
         Name = "Enable ball changer", Flag = "fatal_ball",
         CurrentValue = s.BallChanger.Enabled,
         Callback = function(v)
@@ -3226,7 +3179,7 @@ end)
             if v then pcall(applyBallChanger) else pcall(resetBallChanger) end
         end,
     })
-    PrivacyTab:CreateButton({
+    CosmeticsTab:CreateButton({
         Name = "Reset ball",
         Callback = function()
             s.BallChanger.Enabled = false
@@ -3236,8 +3189,8 @@ end)
         end,
     })
 
-    PrivacyTab:CreateSection("Trail Spoofer")
-    PrivacyTab:CreateDropdown({
+    CosmeticsTab:CreateSection("Trail Spoofer")
+    CosmeticsTab:CreateDropdown({
         Name = "Select trail", Options = #TrailNames > 0 and TrailNames or { "None" },
         CurrentValue = s.TrailSpoofer.SelectedTrail, Flag = "fatal_trail_sel",
         Callback = function(v)
@@ -3246,7 +3199,7 @@ end)
             if s.TrailSpoofer.Enabled then pcall(applyTrailSpoofer) end
         end,
     })
-    PrivacyTab:CreateToggle({
+    CosmeticsTab:CreateToggle({
         Name = "Enable trail spoofer", Flag = "fatal_trail",
         CurrentValue = s.TrailSpoofer.Enabled,
         Callback = function(v)
@@ -3254,7 +3207,7 @@ end)
             if v then pcall(applyTrailSpoofer) else pcall(resetTrailSpoofer) end
         end,
     })
-    PrivacyTab:CreateButton({
+    CosmeticsTab:CreateButton({
         Name = "Reset trail",
         Callback = function()
             s.TrailSpoofer.Enabled = false
@@ -3264,8 +3217,8 @@ end)
         end,
     })
 
-    PrivacyTab:CreateSection("Ball Aura Spoofer")
-    PrivacyTab:CreateDropdown({
+    CosmeticsTab:CreateSection("Ball Aura Spoofer")
+    CosmeticsTab:CreateDropdown({
         Name = "Select aura", Options = #AuraNames > 0 and AuraNames or { "None" },
         CurrentValue = s.BallAura.SelectedAura, Flag = "fatal_aura_sel",
         Callback = function(v)
@@ -3274,7 +3227,7 @@ end)
             if s.BallAura.Enabled then pcall(applyBallAura) end
         end,
     })
-    PrivacyTab:CreateToggle({
+    CosmeticsTab:CreateToggle({
         Name = "Enable ball aura spoofer", Flag = "fatal_aura",
         CurrentValue = s.BallAura.Enabled,
         Callback = function(v)
@@ -3282,7 +3235,7 @@ end)
             if v then pcall(applyBallAura) else pcall(resetBallAura) end
         end,
     })
-    PrivacyTab:CreateButton({
+    CosmeticsTab:CreateButton({
         Name = "Reset ball aura",
         Callback = function()
             s.BallAura.Enabled = false
@@ -3292,29 +3245,115 @@ end)
         end,
     })
 
-    PrivacyTab:CreateSection("Body Aura Changer")
-    PrivacyTab:CreateDropdown({
-        Name = "Select body aura", Options = BodyAura.Names,
-        CurrentValue = s.BodyAura.Selected, Flag = "fatal_bodyaura_sel",
+    CosmeticsTab:CreateSection("Goal Effect")
+    local function getEffectNames()
+        local names = {}
+        for k in pairs(Effects) do table.insert(names, k) end
+        table.sort(names)
+        return names
+    end
+    CosmeticsTab:CreateDropdown({
+        Name = "Select effect", Options = getEffectNames(),
+        CurrentValue = s.Goal.SelectedEffect, Flag = "fatal_goal_sel",
         Callback = function(v)
-            s.BodyAura.Selected = v
-            if s.BodyAura.Enabled then pcall(BodyAura.apply) end
+            s.Goal.SelectedEffect = v
+            s.Goal.CurrentEffect = v
+            if s.Goal.Enabled then pcall(applyGoalEffect) end
         end,
     })
-    PrivacyTab:CreateToggle({
-        Name = "Enable body aura changer", Flag = "fatal_bodyaura",
-        CurrentValue = s.BodyAura.Enabled,
+    CosmeticsTab:CreateToggle({
+        Name = "Enable goal effect changer", Flag = "fatal_goal",
+        CurrentValue = s.Goal.Enabled,
         Callback = function(v)
-            if v then pcall(BodyAura.apply) else pcall(BodyAura.reset) end
+            s.Goal.Enabled = v
+            if v then pcall(applyGoalEffect) else pcall(resetGoalEffect) end
         end,
     })
-    PrivacyTab:CreateButton({
-        Name = "Force aura onto body (clone)",
-        Callback = function() pcall(BodyAura.force) end,
+    CosmeticsTab:CreateButton({
+        Name = "Reset goal effect",
+        Callback = function()
+            s.Goal.Enabled = false
+            s.Goal.SelectedEffect = "LightRay"
+            s.Goal.CurrentEffect = "LightRay"
+            pcall(resetGoalEffect)
+        end,
     })
 
-    UtilityTab:CreateSection("Anti Moderator")
-    UtilityTab:CreateToggle({
+    CosmeticsTab:CreateSection("Court Spoofer")
+    CosmeticsTab:CreateDropdown({
+        Name = "Select court", Options = #CourtNames > 0 and CourtNames or { "None" },
+        CurrentValue = s.CourtSpoofer.SelectedCourt, Flag = "fatal_court_sel",
+        Callback = function(v)
+            s.CourtSpoofer.SelectedCourt = v
+            s.CourtSpoofer.CurrentCourt = v
+            if s.CourtSpoofer.Enabled then pcall(applyCourtSpoofer) end
+        end,
+    })
+    CosmeticsTab:CreateToggle({
+        Name = "Enable court spoofer", Flag = "fatal_court",
+        CurrentValue = s.CourtSpoofer.Enabled,
+        Callback = function(v)
+            s.CourtSpoofer.Enabled = v
+            if v then pcall(applyCourtSpoofer) else pcall(resetCourtSpoofer) end
+        end,
+    })
+    CosmeticsTab:CreateButton({
+        Name = "Reset court",
+        Callback = function()
+            s.CourtSpoofer.Enabled = false
+            s.CourtSpoofer.SelectedCourt = "None"
+            s.CourtSpoofer.CurrentCourt = "None"
+            pcall(resetCourtSpoofer)
+        end,
+    })
+
+    CosmeticsTab:CreateSection("Nameplate & Title")
+    CosmeticsTab:CreateToggle({
+        Name = "Hide my nameplate & tags", Flag = "fatal_np_hide",
+        CurrentValue = s.Visuals.HideOwnNameplate,
+        Callback = function(v) s.Visuals.HideOwnNameplate = v; applyOwnNameplate() end,
+    })
+    CosmeticsTab:CreateInput({
+        Name = "Custom username", Placeholder = "e.g. Nova",
+        CurrentValue = s.Visuals.CustomNameText, Flag = "fatal_np_name",
+        Callback = function(text)
+            s.Visuals.CustomNameText = text
+            s.Visuals.CustomName = (text ~= "")
+            applyOwnNameplate()
+        end,
+    })
+    CosmeticsTab:CreateInput({
+        Name = "Custom record", Placeholder = "e.g. 99-0",
+        CurrentValue = s.Visuals.CustomRecordText, Flag = "Calm_np_rec",
+        Callback = function(text)
+            s.Visuals.CustomRecordText = text
+            s.Visuals.CustomRecord = (text ~= "")
+            applyOwnNameplate()
+        end,
+    })
+    CosmeticsTab:CreateInput({
+        Name = "Custom title", Placeholder = "e.g. Nova Elite",
+        CurrentValue = s.Visuals.CustomTitleText, Flag = "fatal_np_title",
+        Callback = function(text)
+            s.Visuals.CustomTitleText = text
+            s.Visuals.CustomTitle = (text ~= "")
+            applyOwnNameplate()
+        end,
+    })
+
+    SafetyTab:CreateSection("Device Spoofer")
+    SafetyTab:CreateToggle({
+        Name = "Device spoofer", Flag = "fatal_dev", CurrentValue = s.Misc.DeviceSpoofer,
+        Callback = function(v) s.Misc.DeviceSpoofer = v; SpoofDevice() end,
+    })
+    SafetyTab:CreateDropdown({
+        Name = "Device", Options = { "PC", "Mobile", "Gamepad" },
+        CurrentValue = s.Misc.Device, Flag = "fatal_dev_sel",
+        Callback = function(v) s.Misc.Device = v; SpoofDevice() end,
+    })
+
+    SafetyTab:CreateSection("Anti Moderator")
+    SafetyTab:CreateToggle({
         Name = "Anti moderator", Desc = "Notifies when a moderator is in the server.",
         Flag = "fatal_mod", CurrentValue = s.Misc.AntiModerator,
         Callback = function(v)
