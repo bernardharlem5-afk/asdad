@@ -1079,8 +1079,7 @@ else
         },
         Goal = { Enabled = false, SelectedEffect = "LightRay", CurrentEffect = "LightRay" },
         CourtSpoofer = { Enabled = false, SelectedCourt = "None", CurrentCourt = "None" },
-        AvatarSpoof = { Enabled = false, Type = "Korblox" },
-        BadgeSpoof = { Enabled = false, Selected = "Staff" },
+        BadgeSpoofer = { Enabled = false, Selected = "None", Current = "None" },
         BallChanger = { Enabled = false, SelectedBall = "ForceField", CurrentBall = "ForceField" },
         TrailSpoofer = { Enabled = false, SelectedTrail = "None", CurrentTrail = "None" },
         BallAura = { Enabled = false, SelectedAura = "None", CurrentAura = "None" },
@@ -1780,6 +1779,117 @@ else
         return nil
     end
 
+    -- ============================================================
+    -- BADGE SPOOFER (same approach as the court spoofer: Replicator hook +
+    -- PlayerData fallback). Badge assets are found by name, so the list comes
+    -- from the game itself. Local only: only you see the badge you pick.
+    -- ============================================================
+    local Badges, BadgeNames = {}, {}
+    local badgeSlot = "Badge"          -- PlayerData.Equipping slot
+    local badgeReplicateKey, OriginalReplicateBadge = nil, nil
+    local badgeSaved = nil             -- what was equipped before spoofing
+
+    pcall(function()
+        local function addBadgeFolder(folder)
+            if not folder then return end
+            for _, item in folder:GetChildren() do
+                local name = item.Name:gsub("^Badges?_", "")
+                if not Badges[name] then
+                    Badges[name] = item.Name
+                    table.insert(BadgeNames, name)
+                end
+            end
+        end
+
+        local shop = ReplicatedStorage:FindFirstChild("ShopItems")
+        if shop then
+            for _, child in shop:GetChildren() do
+                if child.Name:lower():find("badge", 1, true) then
+                    badgeSlot = child.Name
+                    addBadgeFolder(child)
+                end
+            end
+        end
+        -- Fallback: any folder named *badge* anywhere under ReplicatedStorage.
+        if #BadgeNames == 0 then
+            for _, inst in ReplicatedStorage:GetDescendants() do
+                if inst:IsA("Folder") and inst.Name:lower():find("badge", 1, true) and inst.Parent then
+                    badgeSlot = inst.Name
+                    addBadgeFolder(inst)
+                end
+            end
+        end
+        table.sort(BadgeNames)
+
+        -- Use the game's own slot name if it already has one for badges.
+        pcall(function()
+            local PlayerData = require(ReplicatedStorage.Util.PlayerData)
+            for k in pairs(PlayerData.storedData["Equipping"]) do
+                if tostring(k):lower():find("badge", 1, true) then badgeSlot = k end
+            end
+        end)
+
+        -- The game's own badge replicate function, if it has one.
+        if Replicator then
+            for k, f in pairs(Replicator) do
+                if type(f) == "function" and tostring(k):lower():find("badge", 1, true) then
+                    badgeReplicateKey, OriginalReplicateBadge = k, f
+                end
+            end
+        end
+
+        if #BadgeNames > 0 and (s.BadgeSpoofer.Selected == "None" or s.BadgeSpoofer.Current == "None") then
+            s.BadgeSpoofer.Selected = BadgeNames[1]
+            s.BadgeSpoofer.Current = BadgeNames[1]
+        end
+    end)
+
+    local function applyBadgeSpoofer()
+        local target = Badges[s.BadgeSpoofer.Current]
+        if not target then
+            local lines = { "[BadgeSpoofer] no badge assets found. ShopItems contains:" }
+            pcall(function()
+                for _, c in ReplicatedStorage.ShopItems:GetChildren() do
+                    table.insert(lines, "  " .. c.ClassName .. "  " .. c.Name)
+                end
+            end)
+            print(table.concat(lines, "\n"))
+            Notify({ title = "Badge Spoofer", content = "No badge assets found. See the console (F9).", duration = 5 })
+            return
+        end
+        if Replicator and badgeReplicateKey and OriginalReplicateBadge then
+            Replicator[badgeReplicateKey] = function(Parent, Name, ...)
+                if ownerOfParent(Parent) == LocalPlayer then
+                    local spoofed = Badges[s.BadgeSpoofer.Current]
+                    if spoofed then Name = spoofed end
+                end
+                return OriginalReplicateBadge(Parent, Name, ...)
+            end
+        end
+        pcall(function()
+            local PlayerData = require(ReplicatedStorage.Util.PlayerData)
+            if badgeSaved == nil then
+                badgeSaved = { value = PlayerData.storedData["Equipping"][badgeSlot] }
+            end
+            PlayerData.storedData["Equipping"][badgeSlot] = target
+            PlayerData.storedData["Inventory"][target] = 1
+        end)
+        Notify({ title = "Badge Spoofer", content = "Applied: " .. s.BadgeSpoofer.Current, duration = 2.5 })
+    end
+
+    local function resetBadgeSpoofer()
+        if Replicator and badgeReplicateKey and OriginalReplicateBadge then
+            Replicator[badgeReplicateKey] = OriginalReplicateBadge
+        end
+        pcall(function()
+            local PlayerData = require(ReplicatedStorage.Util.PlayerData)
+            if badgeSaved then
+                PlayerData.storedData["Equipping"][badgeSlot] = badgeSaved.value
+                badgeSaved = nil
+            end
+        end)
+    end
+
     local function applyBallChanger()
         if not Replicator or not OriginalReplicateBall then return end
         Replicator["ReplicateBall"] = function(Parent, Name)
@@ -2392,297 +2502,6 @@ else
             table.insert(out, "Character=" .. tostring(ch) .. " HRP=" .. tostring(ch and ch:FindFirstChild("HumanoidRootPart")))
             print(table.concat(out, "\n"))
             Notify({ title = "Body Aura", content = "Printed to the console (F9).", duration = 3 })
-        end
-    end
-
-    -- ============================================================
-    -- KORBLOX / HEADLESS (local-only look). The character is re-checked every
-    -- fraction of a second, because Hoopz re-applies the avatar after spawn and
-    -- would otherwise undo a one-time change.
-    -- ============================================================
-    local AvatarSpoof = { Types = { "Korblox", "Headless" } }
-    do
-        local saved, charConn, hbConn = {}, nil, nil
-
-        local function remember(inst, props)
-            saved[inst] = saved[inst] or {}
-            for _, p in props do
-                if saved[inst][p] == nil then saved[inst][p] = inst[p] end
-            end
-        end
-
-        local function restore()
-            for inst, props in saved do
-                pcall(function()
-                    for p, v in props do inst[p] = v end
-                end)
-            end
-            table.clear(saved)
-        end
-
-        local function setProp(inst, prop, value)
-            if inst[prop] ~= value then inst[prop] = value end
-        end
-
-        local LEG_PARTS = { "RightUpperLeg", "RightLowerLeg", "RightFoot", "Right Leg" }
-
-        local function enforce()
-            local char = LocalPlayer.Character
-            if not char then return end
-            if s.AvatarSpoof.Type == "Headless" then
-                local head = char:FindFirstChild("Head")
-                if head and head:IsA("BasePart") then
-                    remember(head, { "Transparency" })
-                    setProp(head, "Transparency", 1)
-                    pcall(function() head.LocalTransparencyModifier = 1 end)
-                    for _, d in head:GetDescendants() do
-                        if d:IsA("Decal") or d:IsA("Texture") then
-                            remember(d, { "Transparency" })
-                            setProp(d, "Transparency", 1)
-                        end
-                    end
-                end
-            else
-                for _, n in LEG_PARTS do
-                    local part = char:FindFirstChild(n)
-                    if part and part:IsA("BasePart") then
-                        remember(part, { "Color", "Material", "Transparency", "Reflectance" })
-                        setProp(part, "Transparency", 0)
-                        setProp(part, "Color", Color3.fromRGB(70, 75, 90))
-                        setProp(part, "Material", Enum.Material.Metal)
-                        setProp(part, "Reflectance", 0.15)
-                        for _, d in part:GetChildren() do
-                            -- skin/clothing textures would cover the metal look
-                            if d:IsA("Decal") or d:IsA("Texture") then
-                                remember(d, { "Transparency" })
-                                setProp(d, "Transparency", 1)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-
-        local function startLoop()
-            if hbConn then hbConn:Disconnect() end
-            local last = 0
-            hbConn = RunService.Heartbeat:Connect(function()
-                if os.clock() - last < 0.15 then return end
-                last = os.clock()
-                pcall(enforce)
-            end)
-        end
-
-        function AvatarSpoof.apply()
-            restore()
-            s.AvatarSpoof.Enabled = true
-            pcall(enforce)
-            startLoop()
-            if charConn then charConn:Disconnect() end
-            charConn = LocalPlayer.CharacterAdded:Connect(function()
-                table.clear(saved) -- old character is gone
-            end)
-            Notify({ title = "Avatar Spoofer", content = "Applied: " .. s.AvatarSpoof.Type, duration = 3 })
-        end
-
-        function AvatarSpoof.reset()
-            s.AvatarSpoof.Enabled = false
-            if hbConn then hbConn:Disconnect(); hbConn = nil end
-            if charConn then charConn:Disconnect(); charConn = nil end
-            restore()
-        end
-    end
-
-    -- ============================================================
-    -- BADGE SPOOFER. Hoopz draws a character's badge in a BillboardGui named
-    -- "CreatorTag" inside HumanoidRootPart (next to NameTag and TeamSpot). This
-    -- finds it on you, or copies one from another player, and changes its text
-    -- and colour to the badge you pick. If the game has no such tag in the
-    -- server, it falls back to a plain overhead tag. Local only.
-    -- ============================================================
-    local BadgeSpoof = { Names = { "Staff", "Tester", "Twitch", "Youtuber", "Booster", "VIP" } }
-    do
-        local STYLE = {
-            Staff    = { text = "STAFF",    color = Color3.fromRGB(255, 70, 70)   },
-            Tester   = { text = "TESTER",   color = Color3.fromRGB(80, 200, 120)  },
-            Twitch   = { text = "TWITCH",   color = Color3.fromRGB(145, 70, 255)  },
-            Youtuber = { text = "YOUTUBER", color = Color3.fromRGB(255, 40, 40)   },
-            Booster  = { text = "BOOSTER",  color = Color3.fromRGB(255, 115, 250) },
-            VIP      = { text = "VIP",      color = Color3.fromRGB(255, 200, 40)  },
-        }
-        local TAG_NAME = "CreatorTag"
-        local cloned, fallback, hbConn, charConn = nil, nil, nil, nil
-        local original = {} -- [instance] = { prop = value } for the game's own tag
-
-        local function ownRoot()
-            local c = LocalPlayer.Character
-            return c and c:FindFirstChild("HumanoidRootPart")
-        end
-
-        local function findOtherTag()
-            for _, plr in Players:GetPlayers() do
-                if plr ~= LocalPlayer then
-                    local root = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-                    local tag = root and root:FindFirstChild(TAG_NAME)
-                    if tag and tag:IsA("BillboardGui") then return tag end
-                end
-            end
-        end
-
-        local function remember(inst, prop)
-            original[inst] = original[inst] or {}
-            if original[inst][prop] == nil then original[inst][prop] = inst[prop] end
-        end
-
-        local function styleTag(tag, st, isOwnGameTag)
-            if isOwnGameTag then remember(tag, "Enabled") end
-            if not tag.Enabled then tag.Enabled = true end
-            local firstText = true
-            for _, d in tag:GetDescendants() do
-                if d:IsA("TextLabel") then
-                    if firstText then
-                        firstText = false
-                        if isOwnGameTag then remember(d, "Text"); remember(d, "TextColor3") end
-                        local orig = (original[d] and original[d].Text) or d.Text
-                        local want = (orig:match("^<stroke>") and ("<stroke>" .. st.text .. "</stroke>")) or st.text
-                        if d.Text ~= want then d.Text = want end
-                        if d.TextColor3 ~= st.color then d.TextColor3 = st.color end
-                    end
-                elseif d:IsA("ImageLabel") then
-                    if isOwnGameTag then remember(d, "ImageColor3") end
-                    if d.ImageColor3 ~= st.color then d.ImageColor3 = st.color end
-                elseif d:IsA("UIStroke") then
-                    if isOwnGameTag then remember(d, "Color") end
-                    if d.Color ~= st.color then d.Color = st.color end
-                end
-            end
-        end
-
-        local function buildFallback(st)
-            local head = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head")
-            if not head then return end
-            if fallback then pcall(function() fallback:Destroy() end) end
-            local bb = Instance.new("BillboardGui")
-            bb.Name = "\0"
-            bb.Size = UDim2.fromOffset(110, 26)
-            bb.StudsOffsetWorldSpace = Vector3.new(0, 3.1, 0)
-            bb.Adornee = head
-            local frame = Instance.new("Frame")
-            frame.Size = UDim2.fromScale(1, 1)
-            frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
-            frame.BackgroundTransparency = 0.25
-            frame.BorderSizePixel = 0
-            frame.Parent = bb
-            Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 6)
-            local stroke = Instance.new("UIStroke", frame)
-            stroke.Color = st.color
-            stroke.Thickness = 1.5
-            local label = Instance.new("TextLabel")
-            label.Size = UDim2.fromScale(1, 1)
-            label.BackgroundTransparency = 1
-            label.Text = st.text
-            label.TextColor3 = st.color
-            label.TextScaled = true
-            label.Font = Enum.Font.GothamBold
-            label.Parent = frame
-            bb.Parent = head
-            fallback = bb
-        end
-
-        -- Returns "game" when the game's own tag is used, "fallback" otherwise.
-        local function build()
-            local st = STYLE[s.BadgeSpoof.Selected]
-            local root = ownRoot()
-            if not st or not root then return nil end
-
-            local tag = root:FindFirstChild(TAG_NAME)
-            local own = tag ~= nil and tag ~= cloned
-            if not tag then
-                local src = findOtherTag()
-                if src then
-                    tag = src:Clone()
-                    for _, d in tag:GetDescendants() do
-                        if d:IsA("LuaSourceContainer") then d:Destroy() end
-                    end
-                    tag.Name = TAG_NAME
-                    tag.Parent = root
-                    cloned = tag
-                end
-            end
-            if tag and tag:IsA("BillboardGui") then
-                if fallback then pcall(function() fallback:Destroy() end); fallback = nil end
-                styleTag(tag, st, own)
-                return "game"
-            end
-            buildFallback(st)
-            return "fallback"
-        end
-
-        local function release()
-            if hbConn then hbConn:Disconnect(); hbConn = nil end
-            if cloned then pcall(function() cloned:Destroy() end); cloned = nil end
-            if fallback then pcall(function() fallback:Destroy() end); fallback = nil end
-            for inst, props in original do
-                pcall(function() for p, v in props do inst[p] = v end end)
-            end
-            table.clear(original)
-        end
-
-        function BadgeSpoof.apply()
-            s.BadgeSpoof.Enabled = true
-            if hbConn then hbConn:Disconnect(); hbConn = nil end
-            local mode = build()
-            local last = 0
-            hbConn = RunService.Heartbeat:Connect(function()
-                if os.clock() - last < 0.3 then return end
-                last = os.clock()
-                pcall(build) -- keeps it applied if the game rebuilds its nameplate
-            end)
-            if charConn then charConn:Disconnect() end
-            charConn = LocalPlayer.CharacterAdded:Connect(function()
-                table.clear(original)
-                cloned, fallback = nil, nil
-            end)
-            Notify({
-                title = "Badge Spoofer",
-                content = mode == "game"
-                    and ("Applied on the game's own tag: " .. s.BadgeSpoof.Selected)
-                    or (mode == "fallback"
-                        and "No game badge tag found, showing a plain tag. Run 'Scan nameplates' and send me the console output."
-                        or "Respawn and try again (no character yet)."),
-                duration = 5,
-            })
-        end
-
-        function BadgeSpoof.reset()
-            s.BadgeSpoof.Enabled = false
-            if charConn then charConn:Disconnect(); charConn = nil end
-            release()
-        end
-
-        -- Prints every overhead GUI on every player so the real badge tag can be
-        -- identified. Output goes to the console (F9).
-        function BadgeSpoof.scan()
-            local out, n = { "[BadgeSpoof] overhead GUIs on HumanoidRootPart:" }, 0
-            for _, plr in Players:GetPlayers() do
-                local root = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-                if root then
-                    for _, g in root:GetChildren() do
-                        if g:IsA("BillboardGui") then
-                            table.insert(out, ("%s -> %s (Enabled=%s)"):format(plr.Name, g.Name, tostring(g.Enabled)))
-                            for _, d in g:GetDescendants() do
-                                if n < 120 and (d:IsA("TextLabel") or d:IsA("ImageLabel")) then
-                                    n += 1
-                                    local extra = d:IsA("TextLabel") and (" text=" .. d.Text) or (" image=" .. d.Image)
-                                    table.insert(out, "    " .. d.ClassName .. " " .. d.Name .. extra)
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-            print(table.concat(out, "\n"))
-            Notify({ title = "Badge Spoofer", content = "Scan printed to the console (F9).", duration = 3 })
         end
     end
 
@@ -3634,42 +3453,23 @@ end)
         end,
     })
 
-    CosmeticsTab:CreateSection("Korblox / Headless")
-    CosmeticsTab:CreateDropdown({
-        Name = "Type", Options = AvatarSpoof.Types,
-        CurrentValue = s.AvatarSpoof.Type, Flag = "fatal_avatar_type",
-        Callback = function(v)
-            s.AvatarSpoof.Type = v
-            if s.AvatarSpoof.Enabled then pcall(AvatarSpoof.apply) end
-        end,
-    })
-    CosmeticsTab:CreateToggle({
-        Name = "Enable Korblox / Headless", Flag = "fatal_avatar",
-        CurrentValue = s.AvatarSpoof.Enabled,
-        Callback = function(v)
-            if v then pcall(AvatarSpoof.apply) else pcall(AvatarSpoof.reset) end
-        end,
-    })
-
     CosmeticsTab:CreateSection("Badge Spoofer")
     CosmeticsTab:CreateDropdown({
-        Name = "Badge", Options = BadgeSpoof.Names,
-        CurrentValue = s.BadgeSpoof.Selected, Flag = "fatal_badgetag_sel",
+        Name = "Select badge", Options = #BadgeNames > 0 and BadgeNames or { "None" },
+        CurrentValue = s.BadgeSpoofer.Selected, Flag = "fatal_badge_sel",
         Callback = function(v)
-            s.BadgeSpoof.Selected = v
-            if s.BadgeSpoof.Enabled then pcall(BadgeSpoof.apply) end
+            s.BadgeSpoofer.Selected = v
+            s.BadgeSpoofer.Current = v
+            if s.BadgeSpoofer.Enabled then pcall(applyBadgeSpoofer) end
         end,
     })
     CosmeticsTab:CreateToggle({
         Name = "Enable badge spoofer", Flag = "fatal_badge",
-        CurrentValue = s.BadgeSpoof.Enabled,
+        CurrentValue = s.BadgeSpoofer.Enabled,
         Callback = function(v)
-            if v then pcall(BadgeSpoof.apply) else pcall(BadgeSpoof.reset) end
+            s.BadgeSpoofer.Enabled = v
+            if v then pcall(applyBadgeSpoofer) else pcall(resetBadgeSpoofer) end
         end,
-    })
-    CosmeticsTab:CreateButton({
-        Name = "Scan nameplates (debug)",
-        Callback = function() pcall(BadgeSpoof.scan) end,
     })
 
     SafetyTab:CreateSection("Device Spoofer")
@@ -3868,8 +3668,6 @@ end)
         pcall(resetTrailSpoofer)
         pcall(resetBallAura)
         pcall(BodyAura.reset)
-        pcall(AvatarSpoof.reset)
-        pcall(BadgeSpoof.reset)
         pcall(function() releaseAuraHook(true) end)
         pcall(resetGoalEffect)
         pcall(resetCourtSpoofer)
