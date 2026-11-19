@@ -1080,6 +1080,8 @@ else
         Goal = { Enabled = false, SelectedEffect = "LightRay", CurrentEffect = "LightRay" },
         CourtSpoofer = { Enabled = false, SelectedCourt = "None", CurrentCourt = "None" },
         BadgeSpoofer = { Enabled = false, Selected = "None", Current = "None" },
+        AvatarSpoof = { Enabled = false, Type = "Korblox" },
+        BadgeSpoof = { Enabled = false, Selected = "Staff" },
         BallChanger = { Enabled = false, SelectedBall = "ForceField", CurrentBall = "ForceField" },
         TrailSpoofer = { Enabled = false, SelectedTrail = "None", CurrentTrail = "None" },
         BallAura = { Enabled = false, SelectedAura = "None", CurrentAura = "None" },
@@ -2506,6 +2508,158 @@ else
     end
 
     -- ============================================================
+    -- KORBLOX / HEADLESS (local-only look, ported from saint.txt without its
+    -- remote loadstring; changes only your own character on your screen)
+    -- ============================================================
+    local AvatarSpoof = { Types = { "Korblox", "Headless" } }
+    do
+        local saved, charConn = {}, nil
+
+        local function remember(inst, props)
+            saved[inst] = saved[inst] or {}
+            for _, p in props do
+                if saved[inst][p] == nil then saved[inst][p] = inst[p] end
+            end
+        end
+
+        local function restore()
+            for inst, props in saved do
+                pcall(function()
+                    for p, v in props do inst[p] = v end
+                end)
+            end
+            table.clear(saved)
+        end
+
+        local function applyNow()
+            restore()
+            local char = LocalPlayer.Character
+            if not char then return end
+            if s.AvatarSpoof.Type == "Headless" then
+                local head = char:FindFirstChild("Head")
+                if head then
+                    remember(head, { "Transparency" })
+                    head.Transparency = 1
+                    for _, d in head:GetChildren() do
+                        if d:IsA("Decal") then
+                            remember(d, { "Transparency" })
+                            d.Transparency = 1
+                        end
+                    end
+                end
+            else
+                for _, n in { "RightUpperLeg", "RightLowerLeg", "RightFoot", "Right Leg" } do
+                    local part = char:FindFirstChild(n)
+                    if part and part:IsA("BasePart") then
+                        remember(part, { "Color", "Material", "Transparency" })
+                        part.Color = Color3.fromRGB(70, 75, 90)
+                        part.Material = Enum.Material.Metal
+                        part.Transparency = 0
+                    end
+                end
+            end
+        end
+
+        function AvatarSpoof.apply()
+            s.AvatarSpoof.Enabled = true
+            applyNow()
+            if charConn then charConn:Disconnect() end
+            charConn = LocalPlayer.CharacterAdded:Connect(function(char)
+                pcall(function()
+                    char:WaitForChild("Head", 5)
+                    task.wait(0.7)
+                    if s.AvatarSpoof.Enabled then applyNow() end
+                end)
+            end)
+            Notify({ title = "Avatar Spoofer", content = "Applied: " .. s.AvatarSpoof.Type, duration = 3 })
+        end
+
+        function AvatarSpoof.reset()
+            s.AvatarSpoof.Enabled = false
+            if charConn then charConn:Disconnect(); charConn = nil end
+            restore()
+        end
+    end
+
+    -- ============================================================
+    -- BADGE SPOOFER (local-only overhead tag; list taken from saint.txt)
+    -- ============================================================
+    local BadgeSpoof = { Names = { "Staff", "Tester", "Twitch", "Youtuber", "Booster", "VIP" } }
+    do
+        local STYLE = {
+            Staff    = { text = "STAFF",    color = Color3.fromRGB(255, 70, 70)   },
+            Tester   = { text = "TESTER",   color = Color3.fromRGB(80, 200, 120)  },
+            Twitch   = { text = "TWITCH",   color = Color3.fromRGB(145, 70, 255)  },
+            Youtuber = { text = "YOUTUBER", color = Color3.fromRGB(255, 40, 40)   },
+            Booster  = { text = "BOOSTER",  color = Color3.fromRGB(255, 115, 250) },
+            VIP      = { text = "VIP",      color = Color3.fromRGB(255, 200, 40)  },
+        }
+        local gui, charConn
+
+        local function remove()
+            if gui then pcall(function() gui:Destroy() end); gui = nil end
+        end
+
+        local function build()
+            remove()
+            local char = LocalPlayer.Character
+            local head = char and char:FindFirstChild("Head")
+            local st = STYLE[s.BadgeSpoof.Selected]
+            if not head or not st then return end
+
+            local bb = Instance.new("BillboardGui")
+            bb.Name = "\0"
+            bb.Size = UDim2.fromOffset(110, 26)
+            bb.StudsOffsetWorldSpace = Vector3.new(0, 3.1, 0)
+            bb.AlwaysOnTop = false
+            bb.Adornee = head
+
+            local frame = Instance.new("Frame")
+            frame.Size = UDim2.fromScale(1, 1)
+            frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+            frame.BackgroundTransparency = 0.25
+            frame.BorderSizePixel = 0
+            frame.Parent = bb
+            Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 6)
+            local stroke = Instance.new("UIStroke", frame)
+            stroke.Color = st.color
+            stroke.Thickness = 1.5
+
+            local label = Instance.new("TextLabel")
+            label.Size = UDim2.fromScale(1, 1)
+            label.BackgroundTransparency = 1
+            label.Text = st.text
+            label.TextColor3 = st.color
+            label.TextScaled = true
+            label.Font = Enum.Font.GothamBold
+            label.Parent = frame
+
+            bb.Parent = head
+            gui = bb
+        end
+
+        function BadgeSpoof.apply()
+            s.BadgeSpoof.Enabled = true
+            build()
+            if charConn then charConn:Disconnect() end
+            charConn = LocalPlayer.CharacterAdded:Connect(function(char)
+                pcall(function()
+                    char:WaitForChild("Head", 5)
+                    task.wait(0.5)
+                    if s.BadgeSpoof.Enabled then build() end
+                end)
+            end)
+            Notify({ title = "Badge Spoofer", content = "Badge spoofed: " .. s.BadgeSpoof.Selected, duration = 3 })
+        end
+
+        function BadgeSpoof.reset()
+            s.BadgeSpoof.Enabled = false
+            if charConn then charConn:Disconnect(); charConn = nil end
+            remove()
+        end
+    end
+
+    -- ============================================================
     -- COURT SKIN SPOOFER (Replicator hook + PlayerData fallback)
     -- ============================================================
     local function applyCourtSpoofer()
@@ -3472,6 +3626,44 @@ end)
         end,
     })
 
+    CosmeticsTab:CreateSection("Korblox / Headless")
+    CosmeticsTab:CreateDropdown({
+        Name = "Type", Options = AvatarSpoof.Types,
+        CurrentValue = s.AvatarSpoof.Type, Flag = "fatal_avatar_type",
+        Callback = function(v)
+            s.AvatarSpoof.Type = v
+            if s.AvatarSpoof.Enabled then pcall(AvatarSpoof.apply) end
+        end,
+    })
+    CosmeticsTab:CreateToggle({
+        Name = "Enable Korblox / Headless", Flag = "fatal_avatar",
+        CurrentValue = s.AvatarSpoof.Enabled,
+        Callback = function(v)
+            if v then pcall(AvatarSpoof.apply) else pcall(AvatarSpoof.reset) end
+        end,
+    })
+
+    CosmeticsTab:CreateSection("Badge Tag (Staff, Tester, Twitch...)")
+    CosmeticsTab:CreateDropdown({
+        Name = "Badge", Options = BadgeSpoof.Names,
+        CurrentValue = s.BadgeSpoof.Selected, Flag = "fatal_badgetag_sel",
+        Callback = function(v)
+            s.BadgeSpoof.Selected = v
+            if s.BadgeSpoof.Enabled then pcall(BadgeSpoof.apply) end
+        end,
+    })
+    CosmeticsTab:CreateButton({
+        Name = "Spoof badge",
+        Callback = function() pcall(BadgeSpoof.apply) end,
+    })
+    CosmeticsTab:CreateButton({
+        Name = "Remove all badges",
+        Callback = function()
+            pcall(BadgeSpoof.reset)
+            Notify({ title = "Badge Spoofer", content = "All badges removed", duration = 3 })
+        end,
+    })
+
     SafetyTab:CreateSection("Device Spoofer")
     SafetyTab:CreateToggle({
         Name = "Device spoofer", Flag = "fatal_dev", CurrentValue = s.Misc.DeviceSpoofer,
@@ -3668,6 +3860,8 @@ end)
         pcall(resetTrailSpoofer)
         pcall(resetBallAura)
         pcall(BodyAura.reset)
+        pcall(AvatarSpoof.reset)
+        pcall(BadgeSpoof.reset)
         pcall(function() releaseAuraHook(true) end)
         pcall(resetGoalEffect)
         pcall(resetCourtSpoofer)
