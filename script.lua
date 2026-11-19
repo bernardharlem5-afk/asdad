@@ -2140,12 +2140,58 @@ else
                     r.Anchored = true
                 end
                 weldCount = #roots
-                table.insert(hideConns, RunService.Heartbeat:Connect(function()
+
+                -- Ghost mode. A clone part that is even slightly solid becomes a
+                -- floor under your feet and rides up with you, which launches you
+                -- into the sky when you jump. So every part is forced to be
+                -- non-collidable, non-queryable and untouchable, moved into a
+                -- collision group that collides with nothing, and re-checked
+                -- regularly because the game's own character scripts can flip
+                -- these settings back on anything inside your character.
+                local ghostGroup
+                pcall(function()
+                    local PhysicsService = game:GetService("PhysicsService")
+                    pcall(function() PhysicsService:RegisterCollisionGroup("BodyAuraGhost") end)
+                    for _, g in PhysicsService:GetRegisteredCollisionGroups() do
+                        pcall(function()
+                            PhysicsService:CollisionGroupSetCollidable("BodyAuraGhost", g.name, false)
+                        end)
+                    end
+                    ghostGroup = "BodyAuraGhost"
+                end)
+
+                local function ghost(p)
+                    pcall(function()
+                        if p.CanCollide then p.CanCollide = false end
+                        if p.CanQuery then p.CanQuery = false end
+                        if p.CanTouch then p.CanTouch = false end
+                    end)
+                    if ghostGroup and p.CollisionGroup ~= ghostGroup then
+                        pcall(function() p.CollisionGroup = ghostGroup end)
+                    end
+                end
+                local function ghostAll()
+                    for _, d in clones:GetDescendants() do
+                        if d:IsA("BasePart") then ghost(d) end
+                    end
+                end
+                ghostAll()
+
+                local sinceGhost = 0
+                table.insert(hideConns, RunService.Heartbeat:Connect(function(dt)
                     if not hrp.Parent then return end
                     local base = hrp.CFrame
                     for i, r in roots do
                         if r.Parent then r.CFrame = base * offsets[i] end
                     end
+                    sinceGhost += dt
+                    if sinceGhost >= 0.2 then
+                        sinceGhost = 0
+                        ghostAll()
+                    end
+                end))
+                table.insert(hideConns, clones.DescendantAdded:Connect(function(d)
+                    if d:IsA("BasePart") then ghost(d) end
                 end))
 
                 holder:Destroy()
