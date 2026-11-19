@@ -1079,6 +1079,7 @@ else
         },
         Goal = { Enabled = false, SelectedEffect = "LightRay", CurrentEffect = "LightRay" },
         CourtSpoofer = { Enabled = false, SelectedCourt = "None", CurrentCourt = "None" },
+        BadgeSpoofer = { Enabled = false, Selected = "None", Current = "None" },
         BallChanger = { Enabled = false, SelectedBall = "ForceField", CurrentBall = "ForceField" },
         TrailSpoofer = { Enabled = false, SelectedTrail = "None", CurrentTrail = "None" },
         BallAura = { Enabled = false, SelectedAura = "None", CurrentAura = "None" },
@@ -1776,6 +1777,117 @@ else
             node = node.Parent
         end
         return nil
+    end
+
+    -- ============================================================
+    -- BADGE SPOOFER (same approach as the court spoofer: Replicator hook +
+    -- PlayerData fallback). Badge assets are found by name, so the list comes
+    -- from the game itself. Local only: only you see the badge you pick.
+    -- ============================================================
+    local Badges, BadgeNames = {}, {}
+    local badgeSlot = "Badge"          -- PlayerData.Equipping slot
+    local badgeReplicateKey, OriginalReplicateBadge = nil, nil
+    local badgeSaved = nil             -- what was equipped before spoofing
+
+    pcall(function()
+        local function addBadgeFolder(folder)
+            if not folder then return end
+            for _, item in folder:GetChildren() do
+                local name = item.Name:gsub("^Badges?_", "")
+                if not Badges[name] then
+                    Badges[name] = item.Name
+                    table.insert(BadgeNames, name)
+                end
+            end
+        end
+
+        local shop = ReplicatedStorage:FindFirstChild("ShopItems")
+        if shop then
+            for _, child in shop:GetChildren() do
+                if child.Name:lower():find("badge", 1, true) then
+                    badgeSlot = child.Name
+                    addBadgeFolder(child)
+                end
+            end
+        end
+        -- Fallback: any folder named *badge* anywhere under ReplicatedStorage.
+        if #BadgeNames == 0 then
+            for _, inst in ReplicatedStorage:GetDescendants() do
+                if inst:IsA("Folder") and inst.Name:lower():find("badge", 1, true) and inst.Parent then
+                    badgeSlot = inst.Name
+                    addBadgeFolder(inst)
+                end
+            end
+        end
+        table.sort(BadgeNames)
+
+        -- Use the game's own slot name if it already has one for badges.
+        pcall(function()
+            local PlayerData = require(ReplicatedStorage.Util.PlayerData)
+            for k in pairs(PlayerData.storedData["Equipping"]) do
+                if tostring(k):lower():find("badge", 1, true) then badgeSlot = k end
+            end
+        end)
+
+        -- The game's own badge replicate function, if it has one.
+        if Replicator then
+            for k, f in pairs(Replicator) do
+                if type(f) == "function" and tostring(k):lower():find("badge", 1, true) then
+                    badgeReplicateKey, OriginalReplicateBadge = k, f
+                end
+            end
+        end
+
+        if #BadgeNames > 0 and (s.BadgeSpoofer.Selected == "None" or s.BadgeSpoofer.Current == "None") then
+            s.BadgeSpoofer.Selected = BadgeNames[1]
+            s.BadgeSpoofer.Current = BadgeNames[1]
+        end
+    end)
+
+    local function applyBadgeSpoofer()
+        local target = Badges[s.BadgeSpoofer.Current]
+        if not target then
+            local lines = { "[BadgeSpoofer] no badge assets found. ShopItems contains:" }
+            pcall(function()
+                for _, c in ReplicatedStorage.ShopItems:GetChildren() do
+                    table.insert(lines, "  " .. c.ClassName .. "  " .. c.Name)
+                end
+            end)
+            print(table.concat(lines, "\n"))
+            Notify({ title = "Badge Spoofer", content = "No badge assets found. See the console (F9).", duration = 5 })
+            return
+        end
+        if Replicator and badgeReplicateKey and OriginalReplicateBadge then
+            Replicator[badgeReplicateKey] = function(Parent, Name, ...)
+                if ownerOfParent(Parent) == LocalPlayer then
+                    local spoofed = Badges[s.BadgeSpoofer.Current]
+                    if spoofed then Name = spoofed end
+                end
+                return OriginalReplicateBadge(Parent, Name, ...)
+            end
+        end
+        pcall(function()
+            local PlayerData = require(ReplicatedStorage.Util.PlayerData)
+            if badgeSaved == nil then
+                badgeSaved = { value = PlayerData.storedData["Equipping"][badgeSlot] }
+            end
+            PlayerData.storedData["Equipping"][badgeSlot] = target
+            PlayerData.storedData["Inventory"][target] = 1
+        end)
+        Notify({ title = "Badge Spoofer", content = "Applied: " .. s.BadgeSpoofer.Current, duration = 2.5 })
+    end
+
+    local function resetBadgeSpoofer()
+        if Replicator and badgeReplicateKey and OriginalReplicateBadge then
+            Replicator[badgeReplicateKey] = OriginalReplicateBadge
+        end
+        pcall(function()
+            local PlayerData = require(ReplicatedStorage.Util.PlayerData)
+            if badgeSaved then
+                PlayerData.storedData["Equipping"][badgeSlot] = badgeSaved.value
+                badgeSaved = nil
+            end
+        end)
     end
 
     local function applyBallChanger()
@@ -3338,6 +3450,25 @@ end)
             s.Visuals.CustomTitleText = text
             s.Visuals.CustomTitle = (text ~= "")
             applyOwnNameplate()
+        end,
+    })
+
+    CosmeticsTab:CreateSection("Badge Spoofer")
+    CosmeticsTab:CreateDropdown({
+        Name = "Select badge", Options = #BadgeNames > 0 and BadgeNames or { "None" },
+        CurrentValue = s.BadgeSpoofer.Selected, Flag = "fatal_badge_sel",
+        Callback = function(v)
+            s.BadgeSpoofer.Selected = v
+            s.BadgeSpoofer.Current = v
+            if s.BadgeSpoofer.Enabled then pcall(applyBadgeSpoofer) end
+        end,
+    })
+    CosmeticsTab:CreateToggle({
+        Name = "Enable badge spoofer", Flag = "fatal_badge",
+        CurrentValue = s.BadgeSpoofer.Enabled,
+        Callback = function(v)
+            s.BadgeSpoofer.Enabled = v
+            if v then pcall(applyBadgeSpoofer) else pcall(resetBadgeSpoofer) end
         end,
     })
 
