@@ -1820,15 +1820,58 @@ else
         -- you also want the takeover aura changed.
         local SLOTS = { "Aura" }
 
+        -- The game keeps ball trails in the same folder as body auras. Anything
+        -- that looks like a ball trail is left out of the list. If one still
+        -- slips through, add its exact name here (without the "Aura_" prefix).
+        local NOT_BODY_AURAS = {
+            -- ["SomeBallTrail"] = true,
+        }
+
+        local function looksLikeBallTrail(item, name)
+            local lowered = item.Name:lower()
+            if lowered:find("trail", 1, true) or lowered:find("ball", 1, true) then
+                return true
+            end
+            if NOT_BODY_AURAS[name] then return true end
+            for attrName, attrValue in item:GetAttributes() do
+                if typeof(attrValue) == "string" then
+                    local v = (attrName .. " " .. attrValue):lower()
+                    if v:find("trail", 1, true) or v:find("ball", 1, true) then
+                        return true
+                    end
+                end
+            end
+            -- A pure Trail effect (no particles, no meshes) is a ball trail.
+            local hasTrail, hasBody = false, false
+            for _, d in item:GetDescendants() do
+                if d:IsA("Trail") then
+                    hasTrail = true
+                elseif d:IsA("ParticleEmitter") or d:IsA("MeshPart")
+                    or d:IsA("SpecialMesh") or d:IsA("Model") then
+                    hasBody = true
+                end
+            end
+            return hasTrail and not hasBody
+        end
+
         pcall(function()
             local folder = shop and shop:FindFirstChild("Aura")
             if folder then
+                local skipped = {}
                 for _, item in folder:GetChildren() do
                     local name = item.Name:gsub("^Aura_", "")
-                    items[name] = item.Name
-                    table.insert(BodyAura.Names, name)
+                    if looksLikeBallTrail(item, name) then
+                        table.insert(skipped, name)
+                    else
+                        items[name] = item.Name
+                        table.insert(BodyAura.Names, name)
+                    end
                 end
                 table.sort(BodyAura.Names)
+                if #skipped > 0 then
+                    table.sort(skipped)
+                    print("[BodyAura] left out (look like ball trails): " .. table.concat(skipped, ", "))
+                end
             end
         end)
         if #BodyAura.Names == 0 then BodyAura.Names = { "None" } end
@@ -1890,7 +1933,6 @@ else
         local function hideInstance(d)
             pcall(function()
                 if d:IsA("BasePart") then
-                    d.Anchored = false
                     d.Transparency = 1
                     d.CastShadow = false
                     d.CanCollide = false
@@ -1938,21 +1980,25 @@ else
             RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
         }
 
-        -- Anything in an aura asset that can push, hold or re-rig your character.
-        -- These are what froze you with Iceman, so they never get copied over.
-        local PHYSICS_CLASSES = {
-            "Humanoid", "Animator", "AnimationController", "ForceField",
-            "BodyMover", "Constraint", "JointInstance", "WeldConstraint",
-        }
-
+        -- Only things that would affect YOU get removed. The aura's own joints,
+        -- animators, constraints and rigs stay so every aura keeps its own movement.
         local function sanitize(root)
             local doomed = {}
             for _, d in root:GetDescendants() do
-                for _, cls in PHYSICS_CLASSES do
-                    if d:IsA(cls) then
-                        table.insert(doomed, d)
-                        break
-                    end
+                if d:IsA("ForceField") then
+                    table.insert(doomed, d)
+                elseif d:IsA("Humanoid") then
+                    -- Keep it (animations can run through it) but make it inert.
+                    pcall(function()
+                        d.EvaluateStateMachine = false
+                        d.PlatformStand = true
+                        d.WalkSpeed = 0
+                        d.JumpPower = 0
+                        d.BreakJointsOnDeath = false
+                        d.RequiresNeck = false
+                        d.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+                        d.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+                    end)
                 end
             end
             for _, d in doomed do pcall(function() d:Destroy() end) end
@@ -2074,18 +2120,33 @@ else
                     end
                 end
 
-                -- Weld every part to the root so the whole clone follows every move.
+                -- The clone is NOT welded to your character, so nothing inside it can
+                -- push, hold or freeze you. Each separate piece of the aura (an
+                -- assembly) is anchored and moved onto your body every frame, so
+                -- the aura's own joints, animations and constraints keep running.
+                local roots, seen = {}, {}
                 for _, d in clones:GetDescendants() do
                     if d:IsA("BasePart") then
-                        d.Anchored = false
-                        local w = Instance.new("WeldConstraint")
-                        w.Name = "BodyAuraFollowWeld"
-                        w.Part0 = hrp
-                        w.Part1 = d
-                        w.Parent = d
-                        weldCount += 1
+                        local r = d:GetRootPart() or d
+                        if not seen[r] then
+                            seen[r] = true
+                            roots[#roots + 1] = r
+                        end
                     end
                 end
+                local offsets = {}
+                for i, r in roots do
+                    offsets[i] = hrp.CFrame:ToObjectSpace(r.CFrame)
+                    r.Anchored = true
+                end
+                weldCount = #roots
+                table.insert(hideConns, RunService.Heartbeat:Connect(function()
+                    if not hrp.Parent then return end
+                    local base = hrp.CFrame
+                    for i, r in roots do
+                        if r.Parent then r.CFrame = base * offsets[i] end
+                    end
+                end))
 
                 holder:Destroy()
             end)
@@ -2164,7 +2225,7 @@ else
             watchRespawn(false)
             local msg
             if ok then
-                msg = "On your body: " .. s.BodyAura.Selected .. " (" .. tostring(welded) .. " parts, feet aligned, invisible)"
+                msg = "On your body: " .. s.BodyAura.Selected .. " (" .. tostring(welded) .. " pieces following, feet aligned, invisible)"
             else
                 msg = "Failed: " .. tostring(err)
             end
